@@ -38,23 +38,50 @@ def _parse_fraction(value, path):
     return result
 
 
+def _parse_loss_budget(value):
+    """解析可选 loss_budget：非负 p/q 字符串（分子非负整数、分母正整数）。
+
+    与响应矩阵元素不同，预算不要求落在 [0,1] 内；非法一律定位到
+    ``loss_budget`` 并整次拒绝。
+    """
+    if not isinstance(value, str) or not _FRACTION_RE.match(value):
+        raise ValidationError(
+            "loss_budget 必须为 p/q 形式的字符串（分子非负整数、分母正整数）",
+            "loss_budget",
+        )
+    numerator_text, denominator_text = value.split("/")
+    numerator = int(numerator_text)
+    denominator = int(denominator_text)
+    if denominator == 0:
+        raise ValidationError("loss_budget 分母必须为正整数", "loss_budget")
+    result = Fraction(numerator, denominator)
+    if result < 0:
+        raise ValidationError("loss_budget 必须非负", "loss_budget")
+    return result
+
+
 def validate(raw):
     """校验并归一化原始输入。
 
-    :returns: ``{"classes": [...], "experiments": [{"id", "A", "n"}, ...]}``，
-              其中 ``A`` 的元素为 :class:`Fraction`，``n`` 为整数元组。
+    :returns: ``{"classes": [...], "experiments": [...], "loss_budget":
+              Fraction|None}``，其中 ``A`` 的元素为 :class:`Fraction`，
+              ``n`` 为整数元组；未提供 loss_budget 时其值为 ``None``。
     :raises ValidationError: 任何非法结构、重复、未知成员或数值。
     """
     if not isinstance(raw, dict):
         raise ValidationError("根节点必须为对象", "$")
 
-    allowed_top = {"classes", "experiments"}
+    allowed_top = {"classes", "experiments", "loss_budget"}
     unknown = set(raw) - allowed_top
     if unknown:
         raise ValidationError("未知字段 %r" % sorted(unknown)[0], sorted(unknown)[0])
-    for key in allowed_top:
+    for key in ("classes", "experiments"):
         if key not in raw:
             raise ValidationError("缺少必填字段", key)
+
+    loss_budget = None
+    if "loss_budget" in raw:
+        loss_budget = _parse_loss_budget(raw["loss_budget"])
 
     classes_raw = raw["classes"]
     if not isinstance(classes_raw, list) or len(classes_raw) == 0:
@@ -146,4 +173,8 @@ def validate(raw):
             {"id": experiment["id"], "A": matrix, "n": tuple(counts)}
         )
 
-    return {"classes": classes, "experiments": experiments}
+    return {
+        "classes": classes,
+        "experiments": experiments,
+        "loss_budget": loss_budget,
+    }

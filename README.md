@@ -4,8 +4,8 @@
 群体比例。本服务把所有实验放到**共享的类别比例向量 `w`** 下统一做最大似然
 估计，并刻画 MLE 不唯一时全体解的范围。
 
-全部数值算法（EM、单纯形、主动集 QP、高斯消元）均为手写，仅依赖 Python
-标准库，不调用任何统计拟合或优化求解器。
+全部数值算法（EM、单纯形、主动集 QP、主动集投影梯度、高斯消元）均为
+手写，仅依赖 Python 标准库，不调用任何统计拟合或优化求解器。
 
 ## 模型
 
@@ -20,6 +20,9 @@
       L(w) = (1/N) * sum_ei n_ei * ln(q_ei(w))
 
   零计数项贡献 0；正计数遇到零概率时 L 为负无穷。
+- 可选 `loss_budget`：非负 `p/q` 字符串（分子为非负整数、分母为正整数，
+  不要求落在 `[0,1]`）。给出后追加刻画“允许损失多少似然”的比例范围；
+  省略时输出与旧版完全一致。非法值一律定位到 `loss_budget` 并整次拒绝。
 
 ## 输出
 
@@ -33,11 +36,14 @@
 | `ranges[j].minimum/maximum` | 类别 j 在**全部 MLE 解**上的最小/最大比例 |
 | `ranges[j].min_witness/max_witness` | 分别达到最小/最大端点的完整 `w` 见证（各端点无需同时达到） |
 | `fitted_probabilities[e].q` | 实验 e 的拟合概率，按实验原序、观测行原序 |
+| `budget_ranges[j]` | **仅当给出 `loss_budget` 时存在**。在 `w≥0、Σw=1、L(w)≥L*−loss_budget` 的**全部**比例上（不只是原最优解集），类别 j 的最小/最大值与各端点完整 `w` 见证；字段结构与 `ranges[j]` 相同，按 `classes` 原序，各端点无需同时达到 |
 
 若对任意可行 `w` 都有正计数落在零概率上（正计数单元对应整行为零），
-仅返回 `{"status": "impossible"}`。
+仅返回 `{"status": "impossible"}`（即使带 `loss_budget` 也不追加任何字段）。
 
-比例、概率、范围、见证绝对误差 ≤ 1e-6，归一化似然差 ≤ 1e-8。
+比例、概率、范围、见证绝对误差 ≤ 1e-6，归一化似然差 ≤ 1e-8；
+`budget_ranges` 的见证似然不得低于阈值 `L*−loss_budget` 超过 1e-8。
+零预算（`0/1` 等）时 `budget_ranges` 与原 `ranges` 完全一致。
 
 ## 算法
 
@@ -54,8 +60,15 @@
 5. **代表解**：手写主动集法解等式约束 QP `min sum w_j^2`（目标严格凸，解唯一）。
 6. **比例范围**：对每个类别分别手写两阶段单纯形（Bland 规则）解
    `min/max w_j`，顶点最优解即端点见证。
-7. **自洽核对**：代表与全部见证必须满足 MLE 等式、非负、归一化，且达到同一
-   归一化似然；任一不符即报错，不产出结果。
+7. **loss budget 范围（可选）**：在阈值曲面 `L(w)=L*−B` 上用手写
+   **主动集投影梯度**求每类 min/max。从单纯形目标顶点沿到 MLE 锚点的
+   线段二分取得边界起点，每轮把最速下降方向投影到切平面
+   `{Σd=0, grad L·d=0}` 与活动坐标（w=0）的零空间，走步后再用线段二分
+   拉回阈值曲面；活动集无下降方向时逐个释放坐标重启，收敛到 KKT 最优。
+   零计数项不进梯度，正计数遇零概率的点 `L=−inf` 被二分自动排除。
+8. **自洽核对**：代表与全部见证必须满足 MLE 等式、非负、归一化，且达到同一
+   归一化似然；budget 见证还必须满足似然阈值与端点一致。任一不符即报错，
+   不产出结果。
 
 ## 用法
 
@@ -86,16 +99,17 @@ except ImpossibleEstimation:
 
 ```
 src/mixture_est/
-  validation.py  严格输入校验 + 精确分数解析
+  validation.py  严格输入校验 + 精确分数解析（含可选 loss_budget）
   linalg.py      手写高斯消元
   em.py          EM + Anderson 加速 + KKT 主动集精修
   polytope.py    RREF 零空间、两阶段单纯形 LP、主动集最小范数 QP
+  budget.py      loss budget 阈值曲面上的主动集投影梯度（手写，无求解器）
   solver.py      主编排与自洽核对
   io_.py         JSON 读写、原子替换、NaN/Infinity 拒绝
   errors.py      ValidationError（带路径）/ ImpossibleEstimation
 bin/estimate.py  命令行入口
-tests/           验收测试 + 随机交叉验证
-examples/        题目示例与典型场景
+tests/           验收测试 + 随机交叉验证 + loss_budget 专项验收
+examples/        题目示例与典型场景（含 loss_budget.json）
 run_tests.sh     一键验收
 ```
 
@@ -105,10 +119,15 @@ run_tests.sh     一键验收
 ./run_tests.sh
 # 或
 python3 -I tests/test_acceptance.py
+python3 -I tests/test_budget.py
 python3 -I tests/test_random_crosscheck.py
 ```
 
 覆盖：题目两个示例、通道联合识别、零计数与结构性零、完全相同响应列、
 单类别、多实验共享权重、三相同列、无信息实验、大计数，以及十余类非法输入
-的路径定位。随机交叉验证用独立的坐标上升与密集网格核对 MLE 目标、拟合
-概率、最小范数代表与端点见证。
+的路径定位。loss_budget 专项覆盖题目解析样例（单位阵、`n=[1,0]`、
+预算 `1/1` 得 `[exp(−1),1]` 与 `[0,1−exp(−1)]`）、独立解析求根样例、
+零预算退化、省略字段兼容、impossible 保持原状态、多实验共享比例、零计数、
+相同列、边界端点与非法预算定位，并用独立密集网格对拍 2/3 类小维情形。
+随机交叉验证用独立的坐标上升与密集网格核对 MLE 目标、拟合概率、最小范数
+代表与端点见证。

@@ -1,7 +1,9 @@
 """主编排：可行性判定、MLE、最小范数代表解、比例范围与见证。"""
 
+import copy
 import math
 
+from .budget import budget_ranges
 from .em import compute_q, fit_mle, log_likelihood
 from .errors import ImpossibleEstimation
 from .polytope import linear_program, min_norm
@@ -235,7 +237,7 @@ def estimate(validated):
         if not finite(r["min_witness"]) or not finite(r["max_witness"]):
             raise RuntimeError("见证包含非有限数")
 
-    return {
+    result = {
         "status": "ok",
         "classes": classes,
         "N": total_n,
@@ -244,3 +246,58 @@ def estimate(validated):
         "ranges": ranges,
         "fitted_probabilities": fitted_probabilities,
     }
+
+    # 8) 可选 loss budget：在 L(w) >= L* - budget 的全部比例上重求范围。
+    #    零预算必须与原范围逐位一致，直接复用原结果避免重算引入差异；
+    #    省略 loss_budget 时不输出该字段，保持向后兼容。
+    budget = validated.get("loss_budget")
+    if budget is not None:
+        if budget == 0:
+            result["budget_ranges"] = copy.deepcopy(ranges)
+        else:
+            budget_result = budget_ranges(
+                classes, flat_a, offsets, rows, counts, total_n, max_l,
+                representative, budget,
+            )
+            _check_budget(
+                budget_result, flat_a, offsets, rows, counts, total_n,
+                max_l, float(budget),
+            )
+            result["budget_ranges"] = budget_result
+
+    return result
+
+
+def _check_budget(budget_result, flat_a, offsets, rows, counts, total_n,
+                  max_l, budget):
+    """budget 见证自洽核对：端点一致、归一化、非负、似然不低于 L*-budget。"""
+    threshold = max_l - budget
+    for class_index, r in enumerate(budget_result):
+        if r["minimum"] - r["maximum"] > 1e-9:
+            raise RuntimeError(
+                "budget 范围端点次序错误：%s" % r["class"]
+            )
+        endpoint = {
+            "min_witness": r["minimum"],
+            "max_witness": r["maximum"],
+        }
+        for key, target in endpoint.items():
+            point = r[key]
+            if any(v < -1e-9 for v in point):
+                raise RuntimeError("budget 见证出现负分量")
+            if abs(sum(point) - 1.0) > 1e-9:
+                raise RuntimeError("budget 见证未归一化")
+            if not all(math.isfinite(v) for v in point):
+                raise RuntimeError("budget 见证包含非有限数")
+            # 见证必须真正达到它所对应的报告端点
+            if abs(point[class_index] - target) > OUT_TOL:
+                raise RuntimeError(
+                    "budget 见证未达到报告端点：%s %s" % (r["class"], key)
+                )
+            q_check = compute_q(flat_a, offsets, rows, point)
+            l_check = log_likelihood(counts, q_check, total_n)
+            if not math.isfinite(l_check) or l_check < threshold - L_TOL:
+                raise RuntimeError(
+                    "budget 见证似然 %.10f 低于阈值 %.10f"
+                    % (l_check, threshold)
+                )

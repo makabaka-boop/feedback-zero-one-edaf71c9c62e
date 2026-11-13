@@ -5,5 +5,8 @@ cd "$(dirname "$0")"
 echo "== 验收测试 =="
 python3 -I tests/test_acceptance.py
 echo
+echo "== loss_budget 验收测试（解析样例 + 小维对拍） =="
+python3 -I tests/test_budget.py
+echo
 echo "== 随机交叉验证（独立坐标上升/网格核对） =="
 python3 -I tests/test_random_crosscheck.py
