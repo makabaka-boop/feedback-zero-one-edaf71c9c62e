@@ -5,5 +5,8 @@ cd "$(dirname "$0")"
 echo "== 验收测试 =="
 python3 -I tests/test_acceptance.py
 echo
+echo "== 代表解 QP 回归（手算例 + 独立精确枚举） =="
+python3 -I tests/test_representative_qp.py
+echo
 echo "== 随机交叉验证（独立坐标上升/网格核对） =="
 python3 -I tests/test_random_crosscheck.py

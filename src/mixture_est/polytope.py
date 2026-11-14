@@ -9,7 +9,8 @@ MLE 集合是仿射切片与单纯形的交：
 
 * :func:`null_basis`   —— 行约化求零空间基；
 * :func:`linear_program` —— 两阶段单纯形，返回顶点最优解；
-* :func:`min_norm`    —— 主动集法解最小化 ``sum w_j^2`` 的等式约束 QP。
+* :func:`min_norm`    —— 主动集法解 ``min sum w_j^2`` s.t. ``C w = d, w >= 0``
+  （严格凸 QP，解唯一），带单纯形 LP 最优性证书。
 """
 
 from .linalg import SingularMatrix, solve_linear
@@ -219,65 +220,156 @@ def _repair(point, eq_rows, eq_rhs, feasible):
     return point
 
 
-def min_norm(eq_rows, eq_rhs, feasible):
-    """Compute an equality projection and retain its feasible ray segment.
+# 主动集 QP 的数值容差（远小于输出容差 1e-6）
+QP_STEP_TOL = 1e-12   # 面内位移视为零
+QP_BLOCK_TOL = 1e-15  # 方向分量视为下降（可能触界）
+QP_CERT_TOL = 1e-9    # 最优性证书（相对）容差
 
-    The equality minimizer is formed by the row-space Gram system. If it
-    leaves the nonnegative orthant, restrict the move from the supplied
-    feasible representative to the first coordinate boundary. This keeps
-    the observed probabilities and normalization unchanged throughout.
+
+def _independent_rows(matrix, rhs):
+    """对增广矩阵 ``[matrix | rhs]`` 做 Gauss-Jordan 行约化。
+
+    返回主元行对应的 ``(rows, values)``：系数行满秩，且在系统一致时
+    与原系统等价（非主元行被消为零行而丢弃）。容差与
+    :func:`solver._rref` 一致。
     """
-    n_vars = len(feasible)
-    m = len(eq_rows)
+    n_rows = len(matrix)
+    n_cols = len(matrix[0]) if n_rows else 0
+    aug = [list(matrix[r]) + [rhs[r]] for r in range(n_rows)]
+    scale = max(
+        (abs(aug[r][c]) for r in range(n_rows) for c in range(n_cols)),
+        default=1.0,
+    )
+    tol = 1e-11 * max(1.0, scale)
+    pivot_rows = []
+    row_idx = 0
+    for col in range(n_cols):
+        pivot = max(
+            range(row_idx, n_rows),
+            key=lambda r: abs(aug[r][col]),
+            default=None,
+        )
+        if pivot is None or abs(aug[pivot][col]) <= tol:
+            continue
+        aug[row_idx], aug[pivot] = aug[pivot], aug[row_idx]
+        pivot_value = aug[row_idx][col]
+        aug[row_idx] = [v / pivot_value for v in aug[row_idx]]
+        for r in range(n_rows):
+            if r == row_idx:
+                continue
+            factor = aug[r][col]
+            if factor:
+                aug[r] = [
+                    aug[r][c] - factor * aug[row_idx][c]
+                    for c in range(n_cols + 1)
+                ]
+        pivot_rows.append(row_idx)
+        row_idx += 1
+        if row_idx == n_rows:
+            break
+    rows = [aug[r][:n_cols] for r in pivot_rows]
+    values = [aug[r][n_cols] for r in pivot_rows]
+    return rows, values
+
+
+def _face_min_norm(eq_rows, eq_rhs, zero, n_vars):
+    """求仿射面 ``{x : C x = d, x_j = 0 (j in zero)}`` 的最小范数点。
+
+    调用方保证系统一致（当前可行点的支撑含于自由坐标）。先把
+    ``C_F x = d`` 行约化为满行秩系统 ``R x = b``，则最小范数解为
+    ``x = R^T (R R^T)^{-1} b``（Gram 系统对称正定，精确求解）。
+    """
+    free = [j for j in range(n_vars) if j not in zero]
+    if not free:
+        raise RuntimeError("内部错误：主动集 QP 的自由坐标为空")
+    sub = [[row[j] for j in free] for row in eq_rows]
+    rows, values = _independent_rows(sub, eq_rhs)
+    m = len(rows)
     gram = [
-        [sum(eq_rows[i][j] * eq_rows[k][j] for j in range(n_vars))
-         for k in range(m)]
+        [sum(rows[i][k] * rows[j][k] for k in range(len(free)))
+         for j in range(m)]
         for i in range(m)
     ]
     try:
-        multipliers = solve_linear(gram, eq_rhs, ridge=1e-12)
+        multipliers = solve_linear(gram, values)
     except SingularMatrix:
-        multipliers = solve_linear(gram, eq_rhs, ridge=1e-9)
-    projected = [
-        sum(eq_rows[i][j] * multipliers[i] for i in range(m))
-        for j in range(n_vars)
-    ]
-    direction = [projected[j] - feasible[j] for j in range(n_vars)]
-    step = 1.0
-    for j, delta in enumerate(direction):
-        if delta < -1e-12:
-            step = min(step, max(0.0, feasible[j]) / -delta)
-    point = [feasible[j] + step * direction[j] for j in range(n_vars)]
-    point = [0.0 if abs(value) < 1e-11 else value for value in point]
-    return _repair(point, eq_rows, eq_rhs, feasible)
-
-
-def _strict_interior(eq_rows, eq_rhs, feasible):
-    """把可行点推到相对内部：所有非结构性零的分量严格为正。"""
-    n_vars = len(feasible)
-    point = feasible[:]
-    if all(v > 1e-10 for v in point):
-        return point
-    basis = null_basis(eq_rows)
-    if not basis:
-        # 零空间为零：可行集是单点，直接返回（min_norm 不会再迭代）
-        return point
-    # 沿零空间随机但确定性地组合一个方向，把零分量抬起来
-    direction = [0.0] * n_vars
-    for k, vector in enumerate(basis):
-        sign = 1.0 if k % 2 == 0 else -1.0
-        for j in range(n_vars):
-            direction[j] += sign * vector[j] / (k + 1)
-    step = 1.0
-    for _ in range(60):
-        candidate = [
-            point[j] + step * direction[j] for j in range(n_vars)
-        ]
-        if all(v > 1e-9 for v in candidate):
-            # 投影回等式并确认仍可行
-            repaired = _repair(candidate, eq_rows, eq_rhs, feasible)
-            if all(v >= -1e-12 for v in repaired):
-                return repaired
-        step *= 0.5
-    # 兜底：均匀内部点（一般不满足等式，仅作最后手段）
+        multipliers = solve_linear(gram, values, ridge=1e-12)
+    point = [0.0] * n_vars
+    for k, j in enumerate(free):
+        point[j] = sum(rows[i][k] * multipliers[i] for i in range(m))
     return point
+
+
+def min_norm(eq_rows, eq_rhs, feasible):
+    """在 ``P = {w : C w = d, w >= 0}`` 上求 ``sum w_j^2`` 的唯一最小点。
+
+    手写原始主动集法，不在任何一步用"可行但非最优"的点充数：
+
+    1. **面内阶段**：在当前固定零集 ``Z`` 的仿射面上求最小范数点
+       （:func:`_face_min_norm`）。若该点越出非负象限，从当前可行点
+       沿该方向做比率步（ratio test），把触零坐标全部并入 ``Z`` 后
+       重解，直到当前点就是面内最优点。``Z`` 只增不减，故面内阶段
+       有限步结束，且目标值严格下降。
+    2. **最优性证书**：``w`` 是凸集 ``P`` 上的最小范数点，当且仅当
+       对一切 ``v in P`` 有 ``<w, v> >= ||w||^2``（投影的变分刻画）。
+       用手写两阶段单纯形解 ``min <w, v>`` 验证；证书通过即当前点是
+       全 MLE 集合上的唯一最小范数解。
+    3. **证书修正**：若证书失败，顶点 ``v`` 给出严格下降方向，沿线段
+       ``[w, v]`` 做精确线搜索（线段仍在 ``P`` 内），步长严格为正，
+       目标严格下降且零集严格收缩，随后回到面内阶段。
+
+    目标严格凸保证解唯一；每次外层迭代要么结束于某张面的最小范数点
+    （由零集唯一确定），要么严格降低 ``||w||``，同一零集不会重复
+    出现，算法有限终止。返回前再做一次等式残差修正。
+    """
+    n_vars = len(feasible)
+
+    def clean(point):
+        # 只截断数值噪声产生的微小分量，绝不重新归一化
+        return [v if v > 1e-12 else 0.0 for v in point]
+
+    # 起点：调用方给出的可行 MLE 权重（先投影回等式并清理噪声）
+    w = clean(_repair(list(feasible), eq_rows, eq_rhs, feasible))
+    zero = {j for j in range(n_vars) if w[j] <= 0.0}
+
+    max_outer = 200 * (n_vars + 2)
+    for _ in range(max_outer):
+        # ---- 面内阶段：求当前零集所定仿射面的最小范数点 ----
+        for _ in range(n_vars + 2):
+            y = _face_min_norm(eq_rows, eq_rhs, zero, n_vars)
+            direction = [y[j] - w[j] for j in range(n_vars)]
+            if max(abs(v) for v in direction) <= QP_STEP_TOL:
+                w = clean(y)
+                break
+            # 比率步：在不越出非负象限的前提下尽量走向 y
+            alpha = 1.0
+            for j in range(n_vars):
+                if j not in zero and direction[j] < -QP_BLOCK_TOL:
+                    alpha = min(alpha, w[j] / -direction[j])
+            w = clean([w[j] + alpha * direction[j] for j in range(n_vars)])
+            if alpha >= 1.0:
+                break
+            # 触零坐标（含并列）全部并入固定零集
+            zero.update(j for j in range(n_vars) if w[j] <= 0.0)
+        else:
+            raise RuntimeError("内部错误：主动集 QP 面内迭代未收敛")
+
+        # ---- 最优性证书：min <w, v> >= ||w||^2 ? ----
+        vertex = linear_program(list(w), eq_rows, eq_rhs, w)
+        norm_sq = sum(v * v for v in w)
+        violation = norm_sq - sum(w[j] * vertex[j] for j in range(n_vars))
+        if violation <= QP_CERT_TOL * max(1.0, norm_sq):
+            return _repair(w, eq_rows, eq_rhs, feasible)
+
+        # ---- 证书修正：沿 [w, vertex] 精确线搜索，严格减小 ||w|| ----
+        diff = [w[j] - vertex[j] for j in range(n_vars)]
+        denom = sum(v * v for v in diff)
+        if denom <= 1e-24:
+            # 顶点与当前点数值上重合，无法再改进
+            return _repair(w, eq_rows, eq_rhs, feasible)
+        step = sum(w[j] * diff[j] for j in range(n_vars)) / denom
+        step = min(1.0, max(0.0, step))
+        w = clean([w[j] - step * diff[j] for j in range(n_vars)])
+        zero = {j for j in range(n_vars) if w[j] <= 0.0}
+
+    raise RuntimeError("内部错误：主动集 QP 超过迭代上限")
